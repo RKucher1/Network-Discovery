@@ -237,6 +237,51 @@ def calculate_target_size(target):
     except:
         return 256  # default guess
 
+def import_subnets_from_previous_network(file_path: Path, prefix: int, C: Colors):
+    """
+    Import IPs from a previous network.txt file and aggregate into subnets.
+    Filters to only include private IPs (RFC1918 + custom ranges).
+    Returns list of unique CIDR subnets.
+    """
+    if not file_path.exists():
+        print(color_err(f"[!] Previous network file not found: {file_path}", C), file=sys.stderr)
+        return []
+
+    try:
+        with open(file_path, 'r') as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(color_err(f"[!] Error reading previous network file: {e}", C), file=sys.stderr)
+        return []
+
+    # Extract and filter IPs
+    imported_ips = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        # Handle lines that might have IPs plus other data (take first token)
+        ip_str = line.split()[0] if line.split() else line
+
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            if not isinstance(ip, ipaddress.IPv4Address):
+                continue
+            # Filter to only private IPs
+            if ip_in(ALLOW, ip) and not ip_in(BLOCK, ip):
+                imported_ips.append(ip_str)
+        except ValueError:
+            continue
+
+    if not imported_ips:
+        print(color_warn("[!] No valid private IPs found in previous network file", C))
+        return []
+
+    # Aggregate into subnets
+    subnets = aggregate_subnets(imported_ips, prefix=prefix)
+    return subnets
+
 # ---------- nmap sweep ----------
 def nmap_ping_sweep(target, host_timeout_s=90, max_retries=1, per_target_timeout=None, min_rate=300, ping_methods="default"):
     """
@@ -324,6 +369,9 @@ def main():
                     help="Ping method: default (ICMP), aggressive (ICMP+TCP+ARP), stealth (TCP only), arp-only (ARP only)")
     ap.add_argument("--extract-dns", action="store_true", help="Extract IPs from DNS responses (slower)")
     ap.add_argument("--extract-dhcp", action="store_true", help="Extract IPs from DHCP packets (slower)")
+    ap.add_argument("--import-network", metavar="FILE", help="Import IPs from previous year's network.txt and scan those subnets")
+    ap.add_argument("--import-prefix", type=int, default=16, help="Aggregate imported IPs into /PREFIX subnets (default: 16 for /16)")
+    ap.add_argument("--delete-imported", action="store_true", help="Delete imported network file after processing (avoid artifacts)")
     ap.add_argument("--extra-cidr", action="append", help="Add manual internal CIDRs")
     ap.add_argument("--prioritize-discovered", action="store_true", help="Scan discovered subnets first (recommended)")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI colors in summary/progress")
@@ -385,6 +433,30 @@ def main():
         print(color_dim(f"    Discovered: {', '.join(discovered_targets[:5])}" +
                        (f" ... (+{len(discovered_targets)-5} more)" if len(discovered_targets) > 5 else ""), C))
 
+    # Import subnets from previous year's audit
+    imported_targets = []
+    imported_file_path = None
+    if args.import_network:
+        imported_file_path = Path(args.import_network)
+        print(f"[*] Importing subnets from previous network file: {args.import_network}")
+        imported_targets = import_subnets_from_previous_network(
+            imported_file_path,
+            prefix=args.import_prefix,
+            C=C
+        )
+        if imported_targets:
+            print(color_info(f"[+] Imported {len(imported_targets)} /{args.import_prefix} subnets from previous audit", C))
+            print(color_dim(f"    Imported: {', '.join(imported_targets[:5])}" +
+                           (f" ... (+{len(imported_targets)-5} more)" if len(imported_targets) > 5 else ""), C))
+
+        # Securely delete the imported file if requested (avoid leaving artifacts on client systems)
+        if args.delete_imported and imported_file_path.exists():
+            try:
+                imported_file_path.unlink()
+                print(color_info(f"[+] Deleted imported file: {imported_file_path} (artifact cleanup)", C))
+            except Exception as e:
+                print(color_warn(f"[!] Could not delete imported file: {e}", C), file=sys.stderr)
+
     # fixed baselines (per your playbook)
     baseline_targets = [
         "10.1.0.0/16", "10.10.0.0/16", "10.50.0.0/16", "10.100.0.0/16",
@@ -395,12 +467,12 @@ def main():
 
     # Smart prioritization: scan discovered subnets first (they have active hosts)
     if args.prioritize_discovered:
-        # Discovered first, then extras, then baselines
-        target_order = discovered_targets + extras + baseline_targets
+        # Discovered first, then imported (from prev audit), then extras, then baselines
+        target_order = discovered_targets + imported_targets + extras + baseline_targets
         print(color_info("[+] Prioritizing discovered subnets (active traffic detected)", C))
     else:
-        # Original order: discovered, extras, baselines
-        target_order = discovered_targets + extras + baseline_targets
+        # Original order: discovered, imported, extras, baselines
+        target_order = discovered_targets + imported_targets + extras + baseline_targets
 
     ordered_targets = []
     for t in target_order:

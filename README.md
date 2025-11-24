@@ -71,6 +71,9 @@ sudo python3 Net-Discovery.py --iface eth0 \
 - `--prefix PREFIX` - Aggregate discovered IPs into /PREFIX subnets (default: 24)
 
 ### Targeting Options
+- `--import-network FILE` - Import IPs from previous year's network.txt, extract subnets, and scan them
+- `--import-prefix PREFIX` - Aggregate imported IPs into /PREFIX subnets (default: 16 for /16 ranges)
+- `--delete-imported` - Delete imported file after processing (avoid leaving artifacts on client systems)
 - `--extra-cidr CIDR` - Add manual CIDR ranges (can specify multiple times)
 - `--prioritize-discovered` - Scan discovered subnets first (recommended for speed)
 
@@ -130,6 +133,26 @@ sudo python3 Net-Discovery.py --iface eth0 \
   --min-rate 2000
 ```
 
+### Example 6: Import previous year's audit (recommended for repeat assessments)
+```bash
+# Import last year's network.txt, scan those /16 ranges, and clean up
+sudo python3 Net-Discovery.py --iface eth0 \
+  --duration 120 \
+  --import-network /path/to/2023_network.txt \
+  --import-prefix 16 \
+  --delete-imported \
+  --prioritize-discovered \
+  --ping-method aggressive \
+  --workers 16
+
+# This will:
+# 1. Extract all private IPs from the old network.txt
+# 2. Aggregate them into /16 subnets (e.g., 10.50.0.0/16, 172.16.0.0/16)
+# 3. Add those /16s to the scan targets
+# 4. Delete the imported file after reading (no artifacts left)
+# 5. Scan discovered subnets first, then imported ranges
+```
+
 ## How It Works
 
 1. **Passive Capture**: Captures network traffic using tshark
@@ -138,10 +161,12 @@ sudo python3 Net-Discovery.py --iface eth0 \
    - ARP layer (arp.src.proto_ipv4, arp.dst.proto_ipv4)
    - DNS layer (dns.a - optional with `--extract-dns`)
    - DHCP layer (dhcp.* - optional with `--extract-dhcp`)
-3. **Subnet Aggregation**: Groups discovered IPs into /24 subnets (or custom prefix)
-4. **Target Selection**: Combines discovered subnets + baseline ranges
-5. **Concurrent Scanning**: Runs multiple nmap workers in parallel
-6. **Live Hosts**: Outputs deduplicated list of live IPs
+   - Imported IPs (from previous audits with `--import-network`)
+3. **Private IP Filtering**: Filters to only RFC1918 + custom ranges, blocks reserved IPs
+4. **Subnet Aggregation**: Groups discovered IPs into /24 subnets (or custom prefix)
+5. **Target Selection**: Combines discovered + imported + extra + baseline ranges
+6. **Concurrent Scanning**: Runs multiple nmap workers in parallel
+7. **Live Hosts**: Outputs deduplicated list of live IPs
 
 ## Default Baseline Ranges
 
