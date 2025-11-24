@@ -224,6 +224,7 @@ def main():
     network_txt = outdir / f"network_{tag}.txt"
     network_txt.write_text("")  # truncate/create
     file_lock = Lock()
+    seen_lock = Lock()  # lock for the seen set
     seen = set()
 
     # bookkeeping for progress & summary
@@ -253,8 +254,9 @@ def main():
                 done = len(completed)
                 running = len(in_progress)
                 pend = len(pending)
-                found = len(seen)
                 active_list = list(in_progress)[:3]
+            with seen_lock:
+                found = len(seen)
             elapsed = int(time.monotonic() - start_time)
             # build status line
             status = f"Targets: total={total_targets} done={done} running={running} pend={pend} | hosts={found} | elapsed={elapsed}s"
@@ -272,7 +274,6 @@ def main():
 
     # worker wrapper
     def worker(target):
-        nonlocal total_found
         with progress_lock:
             in_progress.add(target)
             if target in pending:
@@ -293,9 +294,10 @@ def main():
             try:
                 ip = ipaddress.ip_address(s)
                 if ip_in(ALLOW, ip) and not ip_in(BLOCK, ip):
-                    if s not in seen:
-                        seen.add(s)
-                        new_ips.append(s)
+                    with seen_lock:
+                        if s not in seen:
+                            seen.add(s)
+                            new_ips.append(s)
             except Exception:
                 continue
         # stream to file
@@ -319,7 +321,9 @@ def main():
                 try:
                     n = fut.result()
                     total_found += n
-                    print(color_info(f"[+] {t}: {n} new host(s) (running total: {len(seen)})", C))
+                    with seen_lock:
+                        total_seen = len(seen)
+                    print(color_info(f"[+] {t}: {n} new host(s) (running total: {total_seen})", C))
                 except Exception as e:
                     print(color_err(f"[!] {t} raised: {e}", C), file=sys.stderr)
         except KeyboardInterrupt:
