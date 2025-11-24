@@ -108,6 +108,92 @@ def extract_ipv4_from_arp(pcap: Path, C: Colors):
                 continue
     return addrs
 
+def extract_ipv4_from_dns(pcap: Path, C: Colors):
+    """Extract IPs from DNS queries and responses"""
+    try:
+        # Get DNS A record answers
+        r = run([TSHARK_BIN, "-r", str(pcap), "-Y", "dns.a", "-T", "fields",
+                 "-e", "dns.a", "-e", "ip.src", "-e", "ip.dst"], check=False)
+    except FileNotFoundError:
+        print(color_err("[!] tshark not found in PATH.", C), file=sys.stderr); sys.exit(1)
+
+    if r.returncode != 0:
+        print(color_warn(f"[!] tshark DNS read warning (rc={r.returncode}): {r.stderr[:200]}", C), file=sys.stderr)
+
+    addrs = set()
+    for line in r.stdout.splitlines():
+        for tok in line.split("\t"):
+            tok = tok.strip()
+            if not tok:
+                continue
+            # Handle comma-separated multiple DNS answers
+            for ip_str in tok.split(","):
+                ip_str = ip_str.strip()
+                try:
+                    ip = ipaddress.ip_address(ip_str)
+                    if isinstance(ip, ipaddress.IPv4Address):
+                        addrs.add(ip_str)
+                except ValueError:
+                    continue
+    return addrs
+
+def extract_ipv4_from_dhcp(pcap: Path, C: Colors):
+    """Extract IPs from DHCP packets"""
+    try:
+        r = run([TSHARK_BIN, "-r", str(pcap), "-Y", "dhcp", "-T", "fields",
+                 "-e", "dhcp.ip.your", "-e", "dhcp.ip.client", "-e", "dhcp.ip.server",
+                 "-e", "dhcp.option.dhcp_server_id", "-e", "dhcp.option.router"], check=False)
+    except FileNotFoundError:
+        print(color_err("[!] tshark not found in PATH.", C), file=sys.stderr); sys.exit(1)
+
+    if r.returncode != 0:
+        print(color_warn(f"[!] tshark DHCP read warning (rc={r.returncode}): {r.stderr[:200]}", C), file=sys.stderr)
+
+    addrs = set()
+    for line in r.stdout.splitlines():
+        for tok in line.split("\t"):
+            tok = tok.strip()
+            if not tok:
+                continue
+            # Handle comma-separated values (DHCP options can have multiple values)
+            for ip_str in tok.split(","):
+                ip_str = ip_str.strip()
+                try:
+                    ip = ipaddress.ip_address(ip_str)
+                    if isinstance(ip, ipaddress.IPv4Address):
+                        addrs.add(ip_str)
+                except ValueError:
+                    continue
+    return addrs
+
+def extract_mac_to_ip_mapping(pcap: Path, C: Colors):
+    """Extract MAC to IP mappings from ARP packets"""
+    try:
+        r = run([TSHARK_BIN, "-r", str(pcap), "-Y", "arp", "-T", "fields",
+                 "-e", "arp.src.proto_ipv4", "-e", "arp.src.hw_mac"], check=False)
+    except FileNotFoundError:
+        return {}
+
+    if r.returncode != 0:
+        return {}
+
+    mac_to_ips = {}
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            ip_str = parts[0].strip()
+            mac_str = parts[1].strip()
+            if ip_str and mac_str:
+                try:
+                    ip = ipaddress.ip_address(ip_str)
+                    if isinstance(ip, ipaddress.IPv4Address):
+                        if mac_str not in mac_to_ips:
+                            mac_to_ips[mac_str] = set()
+                        mac_to_ips[mac_str].add(ip_str)
+                except ValueError:
+                    continue
+    return mac_to_ips
+
 # ---------- internal filter ----------
 RFC1918 = [ipaddress.ip_network(s) for s in ("10.0.0.0/8","172.16.0.0/12","192.168.0.0/16")]
 CUSTOM  = [ipaddress.ip_network("172.132.0.0/16")]
@@ -152,14 +238,29 @@ def calculate_target_size(target):
         return 256  # default guess
 
 # ---------- nmap sweep ----------
-def nmap_ping_sweep(target, host_timeout_s=90, max_retries=1, per_target_timeout=None, min_rate=300):
+def nmap_ping_sweep(target, host_timeout_s=90, max_retries=1, per_target_timeout=None, min_rate=300, ping_methods="default"):
     """
-    Run nmap ping sweep on a target.
+    Run nmap ping sweep on a target with multiple ping methods.
+    ping_methods: "default" (ICMP only), "aggressive" (ICMP+TCP+ARP), or "stealth" (TCP SYN only)
     Returns (set of IPs, error_string or None)
     """
     cmd = [NMAP_BIN, "-sn", "-n", "-T5", "--max-retries", str(max_retries),
-           "--host-timeout", f"{host_timeout_s}s", "--min-rate", str(min_rate),
-           target, "-oG", "-"]
+           "--host-timeout", f"{host_timeout_s}s", "--min-rate", str(min_rate)]
+
+    # Add ping method flags
+    if ping_methods == "aggressive":
+        # ICMP echo, ICMP timestamp, TCP SYN 80/443, ARP
+        cmd.extend(["-PE", "-PP", "-PS80,443", "-PA80,443", "-PR"])
+    elif ping_methods == "stealth":
+        # TCP SYN only to common ports (no ICMP)
+        cmd.extend(["-PS21,22,23,25,80,135,139,443,445,3389", "-PA80,443", "--disable-arp-ping"])
+    elif ping_methods == "arp-only":
+        # ARP only (fastest for local networks)
+        cmd.extend(["-PR", "--disable-ping"])
+    # else: default nmap behavior
+
+    cmd.extend([target, "-oG", "-"])
+
     try:
         r = run(cmd, timeout=per_target_timeout, check=True)
     except subprocess.TimeoutExpired:
@@ -219,7 +320,12 @@ def main():
     ap.add_argument("--host-timeout", type=int, default=90, help="nmap --host-timeout seconds per host (default 90)")
     ap.add_argument("--max-retries", type=int, default=1, help="nmap --max-retries (default 1)")
     ap.add_argument("--min-rate", type=int, default=300, help="nmap --min-rate packets/sec (default 300)")
+    ap.add_argument("--ping-method", choices=["default", "aggressive", "stealth", "arp-only"], default="default",
+                    help="Ping method: default (ICMP), aggressive (ICMP+TCP+ARP), stealth (TCP only), arp-only (ARP only)")
+    ap.add_argument("--extract-dns", action="store_true", help="Extract IPs from DNS responses (slower)")
+    ap.add_argument("--extract-dhcp", action="store_true", help="Extract IPs from DHCP packets (slower)")
     ap.add_argument("--extra-cidr", action="append", help="Add manual internal CIDRs")
+    ap.add_argument("--prioritize-discovered", action="store_true", help="Scan discovered subnets first (recommended)")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI colors in summary/progress")
     ap.add_argument("--outdir", default="recon_out", help="Output directory")
     ap.add_argument("--label", default="", help="Optional filename label")
@@ -245,9 +351,29 @@ def main():
     ip_from_arp = extract_ipv4_from_arp(pcap, C)
     ip_set = ip_from_ip | ip_from_arp
 
+    # Optional DNS extraction (can find internal IPs resolved by DNS)
+    if args.extract_dns:
+        print("[*] Extracting IPs from DNS packets...")
+        ip_from_dns = extract_ipv4_from_dns(pcap, C)
+        ip_set |= ip_from_dns
+        print(color_info(f"[+] Extracted {len(ip_from_dns)} IPs from DNS layer", C))
+
+    # Optional DHCP extraction (finds DHCP servers, gateways, assigned IPs)
+    if args.extract_dhcp:
+        print("[*] Extracting IPs from DHCP packets...")
+        ip_from_dhcp = extract_ipv4_from_dhcp(pcap, C)
+        ip_set |= ip_from_dhcp
+        print(color_info(f"[+] Extracted {len(ip_from_dhcp)} IPs from DHCP layer", C))
+
+    # MAC to IP mapping for detecting multi-homed hosts
+    mac_to_ips = extract_mac_to_ip_mapping(pcap, C)
+    multi_ip_hosts = {mac: ips for mac, ips in mac_to_ips.items() if len(ips) > 1}
+
     print(color_info(f"[+] Extracted {len(ip_from_ip)} IPs from IP layer", C))
     print(color_info(f"[+] Extracted {len(ip_from_arp)} IPs from ARP layer", C))
     print(color_info(f"[+] Total unique IPs: {len(ip_set)}", C))
+    if multi_ip_hosts:
+        print(color_info(f"[+] Detected {len(multi_ip_hosts)} multi-IP hosts (load balancers/VMs?)", C))
 
     internal_ips = keep_internal(ip_set)
     print(color_info(f"[+] Internal IPs after filtering: {len(internal_ips)}", C))
@@ -266,8 +392,18 @@ def main():
     ]
 
     extras = [c for c in (args.extra_cidr or [])]
+
+    # Smart prioritization: scan discovered subnets first (they have active hosts)
+    if args.prioritize_discovered:
+        # Discovered first, then extras, then baselines
+        target_order = discovered_targets + extras + baseline_targets
+        print(color_info("[+] Prioritizing discovered subnets (active traffic detected)", C))
+    else:
+        # Original order: discovered, extras, baselines
+        target_order = discovered_targets + extras + baseline_targets
+
     ordered_targets = []
-    for t in discovered_targets + extras + baseline_targets:
+    for t in target_order:
         if t not in ordered_targets:
             ordered_targets.append(t)
 
@@ -358,7 +494,8 @@ def main():
         ips, err = nmap_ping_sweep(target, host_timeout_s=args.host_timeout,
                                    max_retries=args.max_retries,
                                    per_target_timeout=args.per_target_timeout,
-                                   min_rate=args.min_rate)
+                                   min_rate=args.min_rate,
+                                   ping_methods=args.ping_method)
         elapsed = time.monotonic() - start
         if err:
             row = {"target": target, "status": "failed", "found": 0, "elapsed": elapsed, "error": err}
