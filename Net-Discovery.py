@@ -61,29 +61,51 @@ def capture_pcap(iface: str, duration: int, snaplen: int, out_pcap: Path, C: Col
 
 def extract_ipv4_from_ip(pcap: Path, C: Colors):
     try:
-        r = run([TSHARK_BIN, "-r", str(pcap), "-T", "fields", "-e", "ip.src", "-e", "ip.dst"])
+        r = run([TSHARK_BIN, "-r", str(pcap), "-T", "fields", "-e", "ip.src", "-e", "ip.dst"], check=False)
     except FileNotFoundError:
         print(color_err("[!] tshark not found in PATH.", C), file=sys.stderr); sys.exit(1)
+
+    if r.returncode != 0:
+        print(color_warn(f"[!] tshark read warning (rc={r.returncode}): {r.stderr[:200]}", C), file=sys.stderr)
+
     addrs = set()
     for line in r.stdout.splitlines():
         for tok in line.split("\t"):
             tok = tok.strip()
-            if tok.count(".") == 3:
-                addrs.add(tok)
+            if not tok:
+                continue
+            # Properly validate IPv4 address
+            try:
+                ip = ipaddress.ip_address(tok)
+                if isinstance(ip, ipaddress.IPv4Address):
+                    addrs.add(tok)
+            except ValueError:
+                continue
     return addrs
 
 def extract_ipv4_from_arp(pcap: Path, C: Colors):
     try:
         r = run([TSHARK_BIN, "-r", str(pcap), "-Y", "arp", "-T", "fields",
-                 "-e", "arp.src.proto_ipv4", "-e", "arp.dst.proto_ipv4"])
+                 "-e", "arp.src.proto_ipv4", "-e", "arp.dst.proto_ipv4"], check=False)
     except FileNotFoundError:
         print(color_err("[!] tshark not found in PATH.", C), file=sys.stderr); sys.exit(1)
+
+    if r.returncode != 0:
+        print(color_warn(f"[!] tshark ARP read warning (rc={r.returncode}): {r.stderr[:200]}", C), file=sys.stderr)
+
     addrs = set()
     for line in r.stdout.splitlines():
         for tok in line.split("\t"):
             tok = tok.strip()
-            if tok.count(".") == 3:
-                addrs.add(tok)
+            if not tok:
+                continue
+            # Properly validate IPv4 address
+            try:
+                ip = ipaddress.ip_address(tok)
+                if isinstance(ip, ipaddress.IPv4Address):
+                    addrs.add(tok)
+            except ValueError:
+                continue
     return addrs
 
 # ---------- internal filter ----------
@@ -121,22 +143,46 @@ def aggregate_subnets(ips, prefix=24):
             pass
     return [str(net) for net,_ in counts.most_common()]
 
+def calculate_target_size(target):
+    """Calculate number of hosts in a CIDR target"""
+    try:
+        net = ipaddress.ip_network(target, strict=False)
+        return net.num_addresses
+    except:
+        return 256  # default guess
+
 # ---------- nmap sweep ----------
-def nmap_ping_sweep(target, host_timeout_s=90, max_retries=1, per_target_timeout=None):
+def nmap_ping_sweep(target, host_timeout_s=90, max_retries=1, per_target_timeout=None, min_rate=300):
+    """
+    Run nmap ping sweep on a target.
+    Returns (set of IPs, error_string or None)
+    """
     cmd = [NMAP_BIN, "-sn", "-n", "-T5", "--max-retries", str(max_retries),
-           "--host-timeout", f"{host_timeout_s}s", target, "-oG", "-"]
+           "--host-timeout", f"{host_timeout_s}s", "--min-rate", str(min_rate),
+           target, "-oG", "-"]
     try:
         r = run(cmd, timeout=per_target_timeout, check=True)
     except subprocess.TimeoutExpired:
         return set(), "timeout(subprocess)"
     except subprocess.CalledProcessError as e:
         return set(), f"nmap_error(rc={e.returncode})"
+    except FileNotFoundError:
+        return set(), "nmap_not_found"
+    except Exception as e:
+        return set(), f"exception({type(e).__name__})"
+
     up = set()
     for line in r.stdout.splitlines():
         if line.startswith("Host:") and "Status: Up" in line:
             parts = line.split()
-            if len(parts) >= 2 and parts[1].count(".")==3:
-                up.add(parts[1])
+            if len(parts) >= 2:
+                # Validate IP before adding
+                try:
+                    ip = ipaddress.ip_address(parts[1])
+                    if isinstance(ip, ipaddress.IPv4Address):
+                        up.add(parts[1])
+                except ValueError:
+                    continue
     return up, None
 
 # ---------- streaming append (thread-safe) ----------
@@ -172,6 +218,7 @@ def main():
     ap.add_argument("--per-target-timeout", type=int, default=180, help="Subprocess timeout per target sweep (default 180s)")
     ap.add_argument("--host-timeout", type=int, default=90, help="nmap --host-timeout seconds per host (default 90)")
     ap.add_argument("--max-retries", type=int, default=1, help="nmap --max-retries (default 1)")
+    ap.add_argument("--min-rate", type=int, default=300, help="nmap --min-rate packets/sec (default 300)")
     ap.add_argument("--extra-cidr", action="append", help="Add manual internal CIDRs")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI colors in summary/progress")
     ap.add_argument("--outdir", default="recon_out", help="Output directory")
@@ -193,13 +240,24 @@ def main():
         if not pcap.exists():
             print(color_err(f"[!] pcap not found: {pcap}", C), file=sys.stderr); sys.exit(1)
 
-    ip_set = set()
-    ip_set |= extract_ipv4_from_ip(pcap, C)
-    ip_set |= extract_ipv4_from_arp(pcap, C)
+    print(f"[*] Extracting IPs from pcap: {pcap}")
+    ip_from_ip = extract_ipv4_from_ip(pcap, C)
+    ip_from_arp = extract_ipv4_from_arp(pcap, C)
+    ip_set = ip_from_ip | ip_from_arp
+
+    print(color_info(f"[+] Extracted {len(ip_from_ip)} IPs from IP layer", C))
+    print(color_info(f"[+] Extracted {len(ip_from_arp)} IPs from ARP layer", C))
+    print(color_info(f"[+] Total unique IPs: {len(ip_set)}", C))
+
     internal_ips = keep_internal(ip_set)
+    print(color_info(f"[+] Internal IPs after filtering: {len(internal_ips)}", C))
 
     # discovered /24 targets
     discovered_targets = aggregate_subnets(internal_ips, prefix=args.prefix)
+    print(color_info(f"[+] Discovered /{args.prefix} subnets: {len(discovered_targets)}", C))
+    if discovered_targets:
+        print(color_dim(f"    Discovered: {', '.join(discovered_targets[:5])}" +
+                       (f" ... (+{len(discovered_targets)-5} more)" if len(discovered_targets) > 5 else ""), C))
 
     # fixed baselines (per your playbook)
     baseline_targets = [
@@ -219,6 +277,17 @@ def main():
         print("\n" + color_ok("✔ All output files saved in:", C))
         print(f"    {outdir.resolve()}")
         return 0
+
+    # Warn about large networks
+    total_hosts = sum(calculate_target_size(t) for t in ordered_targets)
+    large_targets = [t for t in ordered_targets if calculate_target_size(t) > 1024]
+    if large_targets:
+        print(color_warn(f"[!] Warning: {len(large_targets)} large network(s) detected (>{1024} hosts)", C))
+        print(color_dim(f"    Large networks: {', '.join(large_targets[:3])}" +
+                       (f" ... (+{len(large_targets)-3} more)" if len(large_targets) > 3 else ""), C))
+        print(color_info(f"[+] Estimated total hosts to scan: {total_hosts:,}", C))
+        estimated_time_min = (total_hosts / args.min_rate) / 60
+        print(color_info(f"[+] Estimated scan time: ~{estimated_time_min:.1f} minutes (at {args.min_rate} packets/sec)", C))
 
     # prepare streaming network file
     network_txt = outdir / f"network_{tag}.txt"
@@ -274,6 +343,12 @@ def main():
 
     # worker wrapper
     def worker(target):
+        # Check if stop was requested before starting
+        if stop_requested:
+            row = {"target": target, "status": "skipped", "found": 0, "elapsed": 0, "error": "interrupted"}
+            record_row(row)
+            return 0
+
         with progress_lock:
             in_progress.add(target)
             if target in pending:
@@ -282,7 +357,8 @@ def main():
         start = time.monotonic()
         ips, err = nmap_ping_sweep(target, host_timeout_s=args.host_timeout,
                                    max_retries=args.max_retries,
-                                   per_target_timeout=args.per_target_timeout)
+                                   per_target_timeout=args.per_target_timeout,
+                                   min_rate=args.min_rate)
         elapsed = time.monotonic() - start
         if err:
             row = {"target": target, "status": "failed", "found": 0, "elapsed": elapsed, "error": err}
